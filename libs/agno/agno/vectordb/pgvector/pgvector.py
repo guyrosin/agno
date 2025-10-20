@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Union, cast
 from agno.utils.string import generate_id
 
 try:
-    from sqlalchemy import update
+    from sqlalchemy import and_, update
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.engine import Engine, create_engine
     from sqlalchemy.inspection import inspect
@@ -708,6 +708,32 @@ class PgVector(VectorDb):
         """Search asynchronously by running in a thread."""
         return await asyncio.to_thread(self.search, query, limit, filters)
 
+    def _build_metadata_where_clause(self, filters: Dict[str, Any]):
+        """
+        Build a SQLAlchemy WHERE clause for JSONB `meta_data` based on provided filters.
+
+        Behavior:
+        - Exact match (default): {"key": value} uses JSONB containment for each key.
+        - Substring match: {"key": {"contains": "needle"}} uses case-insensitive ILIKE on meta_data->>key.
+        - Multiple keys are ANDed together.
+        """
+        conditions = []
+        for key, value in filters.items():
+            if isinstance(value, dict) and "contains" in value:
+                needle = value.get("contains")
+                if isinstance(needle, str) and needle != "":
+                    key_text = self.table.c.meta_data.op("->>")(key)
+                    conditions.append(key_text.ilike(f"%{needle}%"))
+            else:
+                # Keep existing exact-match semantics per key
+                conditions.append(self.table.c.meta_data.contains({key: value}))
+
+        if not conditions:
+            return None
+        if len(conditions) == 1:
+            return conditions[0]
+        return and_(*conditions)
+
     def vector_search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
         """
         Perform a vector similarity search.
@@ -716,6 +742,7 @@ class PgVector(VectorDb):
             query (str): The search query.
             limit (int): Maximum number of results to return.
             filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+                Supports substring via {"field": {"contains": "text"}} (ILIKE).
 
         Returns:
             List[Document]: List of matching documents.
@@ -742,7 +769,9 @@ class PgVector(VectorDb):
 
             # Apply filters if provided
             if filters is not None:
-                stmt = stmt.where(self.table.c.meta_data.contains(filters))
+                where_clause = self._build_metadata_where_clause(filters)
+                if where_clause is not None:
+                    stmt = stmt.where(where_clause)
 
             # Order the results based on the distance metric
             if self.distance == Distance.l2:
@@ -823,6 +852,7 @@ class PgVector(VectorDb):
             query (str): The search query.
             limit (int): Maximum number of results to return.
             filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+                Supports substring via {"field": {"contains": "text"}} (ILIKE).
 
         Returns:
             List[Document]: List of matching documents.
@@ -851,8 +881,9 @@ class PgVector(VectorDb):
 
             # Apply filters if provided
             if filters is not None:
-                # Use the contains() method for JSONB columns to check if the filters column contains the specified filters
-                stmt = stmt.where(self.table.c.meta_data.contains(filters))
+                where_clause = self._build_metadata_where_clause(filters)
+                if where_clause is not None:
+                    stmt = stmt.where(where_clause)
 
             # Order by the relevance rank
             stmt = stmt.order_by(text_rank.desc())
@@ -907,6 +938,7 @@ class PgVector(VectorDb):
             query (str): The search query.
             limit (int): Maximum number of results to return.
             filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+                Supports substring via {"field": {"contains": "text"}} (ILIKE).
 
         Returns:
             List[Document]: List of matching documents.
@@ -973,7 +1005,9 @@ class PgVector(VectorDb):
 
             # Apply filters if provided
             if filters is not None:
-                stmt = stmt.where(self.table.c.meta_data.contains(filters))
+                where_clause = self._build_metadata_where_clause(filters)
+                if where_clause is not None:
+                    stmt = stmt.where(where_clause)
 
             # Order the results by the hybrid score in descending order
             stmt = stmt.order_by(desc("hybrid_score"))
